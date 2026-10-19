@@ -22,9 +22,12 @@ import static org.apache.polaris.core.persistence.PrincipalSecretsGenerator.RAND
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
+import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -114,6 +117,316 @@ public class InMemoryEntityCacheTest {
    */
   InMemoryEntityCache allocateNewCache() {
     return new InMemoryEntityCache(diagServices, callCtx.getRealmConfig(), this.metaStoreManager);
+  }
+
+  @Test
+  void testMeters() {
+    SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+    InMemoryEntityCache cache = allocateInstrumentedCache(meterRegistry, "testRealm");
+
+    // a miss on the by-name index, then a hit
+    EntityCacheByNameKey catalogName = new EntityCacheByNameKey(PolarisEntityType.CATALOG, "test");
+    assertThat(cache.getOrLoadEntityByName(this.callCtx, catalogName)).isNotNull();
+    assertThat(cache.getOrLoadEntityByName(this.callCtx, catalogName))
+        .extracting(EntityCacheLookupResult::cacheHit)
+        .isEqualTo(true);
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_GETS_BY_NAME)
+                .tag("cache", InMemoryEntityCache.CACHE_NAME)
+                .tag("realm_id", "testRealm")
+                .tag("result", "miss")
+                .counter()
+                .count())
+        .isEqualTo(1.0d);
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_GETS_BY_NAME)
+                .tag("result", "hit")
+                .counter()
+                .count())
+        .isEqualTo(1.0d);
+
+    // one entity is cached, in both indexes
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_ENTRIES)
+                .tag("index", "by-id")
+                .gauge()
+                .value())
+        .isEqualTo(1.0d);
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_ENTRIES)
+                .tag("index", "by-name")
+                .gauge()
+                .value())
+        .isEqualTo(1.0d);
+    assertThat(meterRegistry.get(InMemoryEntityCache.METER_CACHE_CAPACITY).gauge().value())
+        .isEqualTo(
+            callCtx
+                .getRealmConfig()
+                .getConfig(FeatureConfiguration.ENTITY_CACHE_WEIGHER_TARGET)
+                .doubleValue());
+    assertThat(meterRegistry.get(InMemoryEntityCache.METER_CACHE_WEIGHT).gauge().value())
+        .isGreaterThan(0.0d);
+
+    // Caffeine's own statistics are reported for the by-id index, without the extra tags, and only
+    // for lookups by id: the lookups by name above resolved their id through the by-id index
+    // without recording a lookup by id
+    assertThat(meterRegistry.get("cache.gets").counters())
+        .isNotEmpty()
+        .allSatisfy(
+            counter -> {
+              assertThat(counter.getId().getTag("cache")).isEqualTo(InMemoryEntityCache.CACHE_NAME);
+              assertThat(counter.getId().getTag("realm_id")).isNull();
+              assertThat(counter.count()).isEqualTo(0.0d);
+            });
+
+    // a lookup by id on the other hand is recorded by Caffeine
+    PolarisBaseEntity catalog =
+        cache.getOrLoadEntityByName(this.callCtx, catalogName).cacheEntry().getEntity();
+    assertThat(
+            cache.getOrLoadEntityById(
+                this.callCtx, catalog.getCatalogId(), catalog.getId(), catalog.getType()))
+        .isNotNull();
+    assertThat(meterRegistry.get("cache.gets").tag("result", "hit").counter().count())
+        .isEqualTo(1.0d);
+
+    // and mirrored on the per-instance counter, which does carry the realm
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_GETS_BY_ID)
+                .tag("realm_id", "testRealm")
+                .tag("result", "hit")
+                .counter()
+                .count())
+        .isEqualTo(1.0d);
+
+    // the meters of this cache instance are removed on request, the shared ones are kept
+    cache.close();
+    assertThat(meterRegistry.find(InMemoryEntityCache.METER_CACHE_GETS_BY_NAME).meters()).isEmpty();
+    assertThat(meterRegistry.find(InMemoryEntityCache.METER_CACHE_GETS_BY_ID).meters()).isEmpty();
+    assertThat(meterRegistry.find(InMemoryEntityCache.METER_CACHE_ENTRIES).meters()).isEmpty();
+    assertThat(meterRegistry.find(InMemoryEntityCache.METER_CACHE_CAPACITY).meters()).isEmpty();
+    assertThat(meterRegistry.find(InMemoryEntityCache.METER_CACHE_WEIGHT).meters()).isEmpty();
+    assertThat(meterRegistry.find("cache.gets").meters()).isNotEmpty();
+  }
+
+  @Test
+  void testMetersAreOptional() {
+    // the cache is fully functional without a registry
+    InMemoryEntityCache cache = this.allocateNewCache();
+    assertThat(
+            cache.getOrLoadEntityByName(
+                this.callCtx, new EntityCacheByNameKey(PolarisEntityType.CATALOG, "test")))
+        .isNotNull();
+  }
+
+  /**
+   * Builds an instrumented cache tagged for {@code realmId}, sharing {@code meterRegistry}.
+   * Caffeine's bookkeeping - including the weighted size the weight gauge reports - is normally
+   * applied asynchronously, so these caches run it on the calling thread to keep the meters in step
+   * with the writes.
+   */
+  private InMemoryEntityCache allocateInstrumentedCache(
+      SimpleMeterRegistry meterRegistry, String realmId) {
+    return new InMemoryEntityCache(
+        diagServices,
+        callCtx.getRealmConfig(),
+        this.metaStoreManager,
+        Optional.of(meterRegistry),
+        Tags.of("realm_id", realmId),
+        Runnable::run);
+  }
+
+  /** Warms the cache by name, then performs one lookup by id, which Caffeine records. */
+  private void warmAndLookupById(InMemoryEntityCache cache) {
+    EntityCacheByNameKey catalogName = new EntityCacheByNameKey(PolarisEntityType.CATALOG, "test");
+    PolarisBaseEntity catalog =
+        cache.getOrLoadEntityByName(this.callCtx, catalogName).cacheEntry().getEntity();
+    cache.getOrLoadEntityById(
+        this.callCtx, catalog.getCatalogId(), catalog.getId(), catalog.getType());
+  }
+
+  @Test
+  void testMetersOfSeveralRealmsCoexist() {
+    SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+    InMemoryEntityCache cacheA = allocateInstrumentedCache(meterRegistry, "realmA");
+    InMemoryEntityCache cacheB = allocateInstrumentedCache(meterRegistry, "realmB");
+
+    // realmA looks up by name twice (a miss, then a hit), realmB only once (a miss)
+    EntityCacheByNameKey catalogName = new EntityCacheByNameKey(PolarisEntityType.CATALOG, "test");
+    cacheA.getOrLoadEntityByName(this.callCtx, catalogName);
+    cacheA.getOrLoadEntityByName(this.callCtx, catalogName);
+    cacheB.getOrLoadEntityByName(this.callCtx, catalogName);
+
+    // the entity cache specific meters are per realm, so neither cache overwrites the other
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_GETS_BY_NAME)
+                .tag("realm_id", "realmA")
+                .tag("result", "hit")
+                .counter()
+                .count())
+        .isEqualTo(1.0d);
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_GETS_BY_NAME)
+                .tag("realm_id", "realmB")
+                .tag("result", "hit")
+                .counter()
+                .count())
+        .isEqualTo(0.0d);
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_GETS_BY_NAME)
+                .tag("realm_id", "realmB")
+                .tag("result", "miss")
+                .counter()
+                .count())
+        .isEqualTo(1.0d);
+
+    // both realms report their own capacity gauge rather than sharing a single one
+    assertThat(meterRegistry.find(InMemoryEntityCache.METER_CACHE_CAPACITY).gauges())
+        .hasSize(2)
+        .extracting(gauge -> gauge.getId().getTag("realm_id"))
+        .containsExactlyInAnyOrder("realmA", "realmB");
+
+    // Caffeine's statistics on the other hand are shared: they carry no realm and are summed over
+    // the realms, one lookup by id from either cache landing on the same counter
+    warmAndLookupById(cacheA);
+    warmAndLookupById(cacheB);
+    assertThat(meterRegistry.find("cache.gets").tag("result", "hit").counters()).hasSize(1);
+    assertThat(meterRegistry.get("cache.gets").tag("result", "hit").counter().count())
+        .isEqualTo(2.0d);
+    assertThat(
+            meterRegistry
+                .get("cache.gets")
+                .tag("result", "hit")
+                .counter()
+                .getId()
+                .getTag("realm_id"))
+        .isNull();
+
+    // the same lookups are counted per realm as well, which is what makes a single realm's hit
+    // ratio recoverable from the aggregate
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_GETS_BY_ID)
+                .tag("realm_id", "realmA")
+                .tag("result", "hit")
+                .counter()
+                .count())
+        .isEqualTo(1.0d);
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_GETS_BY_ID)
+                .tag("realm_id", "realmB")
+                .tag("result", "hit")
+                .counter()
+                .count())
+        .isEqualTo(1.0d);
+    assertThat(
+            meterRegistry
+                .find(InMemoryEntityCache.METER_CACHE_GETS_BY_ID)
+                .tag("result", "hit")
+                .counters())
+        .hasSize(2);
+  }
+
+  @Test
+  void testMetersAreReRegisteredAfterCloseOfSameRealm() {
+    SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+    InMemoryEntityCache purged = allocateInstrumentedCache(meterRegistry, "realmA");
+    purged.getOrLoadEntityByName(
+        this.callCtx, new EntityCacheByNameKey(PolarisEntityType.CATALOG, "test"));
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_ENTRIES)
+                .tag("index", "by-name")
+                .gauge()
+                .value())
+        .isEqualTo(1.0d);
+
+    // a realm is purged and then used again, which builds a second cache with the same tags.
+    // Micrometer ignores a re-registration of a meter that is still registered, so without the
+    // close() the gauges would keep reporting the purged cache.
+    purged.close();
+    InMemoryEntityCache rebuilt = allocateInstrumentedCache(meterRegistry, "realmA");
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_ENTRIES)
+                .tag("index", "by-name")
+                .gauge()
+                .value())
+        .isEqualTo(0.0d);
+
+    // the rebuilt cache owns the meters now: they follow it, not the purged one
+    rebuilt.getOrLoadEntityByName(
+        this.callCtx, new EntityCacheByNameKey(PolarisEntityType.CATALOG, "test"));
+    rebuilt.getOrLoadEntityByName(
+        this.callCtx, new EntityCacheByNameKey(PolarisEntityType.CATALOG, "test"));
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_ENTRIES)
+                .tag("index", "by-name")
+                .gauge()
+                .value())
+        .isEqualTo(1.0d);
+    assertThat(
+            meterRegistry
+                .get(InMemoryEntityCache.METER_CACHE_GETS_BY_NAME)
+                .tag("realm_id", "realmA")
+                .tag("result", "hit")
+                .counter()
+                .count())
+        .isEqualTo(1.0d);
+  }
+
+  @Test
+  void testRefreshDoesNotRecordLookupsByName() {
+    SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+    InMemoryEntityCache cache = allocateInstrumentedCache(meterRegistry, "testRealm");
+
+    // load the catalog, which is one lookup by name and a miss
+    EntityCacheByNameKey catalogName = new EntityCacheByNameKey(PolarisEntityType.CATALOG, "test");
+    PolarisBaseEntity catalog =
+        cache.getOrLoadEntityByName(this.callCtx, catalogName).cacheEntry().getEntity();
+    assertThat(byNameCount(meterRegistry, "hit")).isEqualTo(0.0d);
+    assertThat(byNameCount(meterRegistry, "miss")).isEqualTo(1.0d);
+    assertThat(byIdCount(meterRegistry, "hit")).isEqualTo(0.0d);
+
+    // refreshing looks the entity up by id, so it must leave the by-name counters where they are
+    assertThat(
+            cache.getAndRefreshIfNeeded(
+                this.callCtx,
+                catalog,
+                catalog.getEntityVersion(),
+                catalog.getGrantRecordsVersion()))
+        .isNotNull();
+    assertThat(byNameCount(meterRegistry, "hit")).isEqualTo(0.0d);
+    assertThat(byNameCount(meterRegistry, "miss")).isEqualTo(1.0d);
+
+    // the lookup by id that the same call performs is a real one and is recorded, which also shows
+    // that the refresh above actually reached the cache
+    assertThat(byIdCount(meterRegistry, "hit")).isEqualTo(1.0d);
+  }
+
+  private double byNameCount(SimpleMeterRegistry meterRegistry, String result) {
+    return meterRegistry
+        .get(InMemoryEntityCache.METER_CACHE_GETS_BY_NAME)
+        .tag("result", result)
+        .counter()
+        .count();
+  }
+
+  private double byIdCount(SimpleMeterRegistry meterRegistry, String result) {
+    return meterRegistry
+        .get(InMemoryEntityCache.METER_CACHE_GETS_BY_ID)
+        .tag("result", result)
+        .counter()
+        .count();
   }
 
   @Test

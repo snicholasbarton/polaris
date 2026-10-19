@@ -95,6 +95,8 @@ request adding CHANGELOG notes for breaking (!) changes and possibly other secti
 - Python CLI: added `namespaces update` to set and remove namespace properties
 - NoSQL: the commit retry settings are now configurable via `polaris.persistence.retry.*`
 - Python CLI: added global `--ssl-ca-cert` and `--insecure` options to verify the server with a custom CA bundle or to disable TLS certificate verification
+- JDBC per-realm entity caches are now instrumented so cache sizing can be tuned
+  against real workloads. Check the telemetry documentation for more details on new metrics.
 
 ### Changes
 
